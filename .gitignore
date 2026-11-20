@@ -1,0 +1,30 @@
+# Python byte-code and caches
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+
+# Environment and packaging
+.venv/
+env/
+venv/
+.env
+build/
+dist/
+*.egg-info/
+
+# Operating system artifacts
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# Offline database, reference biometric photos, model weights, and reports
+attendance.db
+attendance.db-*
+known_faces/
+models/
+reports/
+*.xlsx
+
+# docs/ is intentionally tracked for wiring diagrams and documentation assets
+# docs/ is NOT excluded here — wiring_diagram.jpg is committed to the repo
