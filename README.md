@@ -127,8 +127,8 @@ The following directories are created at runtime and excluded from Git:
 ### Step 1: Clone the Repository
 
 ```bash
-git clone https://github.com/your-username/smart-attendance.git
-cd smart-attendance
+git clone https://github.com/1423plmokn-debug/smart-attendance-ai-rfid.git
+cd smart-attendance-ai-rfid
 ```
 
 ### Step 2: Create and Activate a Virtual Environment

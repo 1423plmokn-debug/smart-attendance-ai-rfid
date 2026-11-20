@@ -25,6 +25,9 @@ known_faces/
 models/
 reports/
 *.xlsx
+.mpl_cache/
+scratch/
+EcoSensing_ESP32_WiFi_Soil_Sentinel/
 
 # docs/ is intentionally tracked for wiring diagrams and documentation assets
 # docs/ is NOT excluded here — wiring_diagram.jpg is committed to the repo
