@@ -122,6 +122,10 @@ RFID_MAP_FILE = BASE_DIR / "rfid_cards.json"
 RFID_PORT     = os.environ.get("RFID_PORT", "COM5")
 RFID_BAUD     = int(os.environ.get("RFID_BAUD", "115200"))
 
+CLOUD_DEMO: bool = os.environ.get("CLOUD_DEMO", "0") == "1"
+SERVER_HOST: str = os.environ.get("HOST", "127.0.0.1")
+SERVER_PORT: int = int(os.environ.get("PORT", "8000"))
+
 log.info("Directories verified — known_faces: %s | models: %s", KNOWN_DIR, MODELS_DIR)
 
 # ACADEMIC DATA
@@ -1805,25 +1809,31 @@ async def lifespan(app: FastAPI):
     loaded_count = FACE_DB.load()
     log.info("Server startup complete — Face database cached in memory (%d faces loaded).", loaded_count)
 
-    # Start independent RFID background listener as an asyncio background task on startup
-    rfid_task = asyncio.create_task(rfid_background_listener(), name="rfid-background-listener")
-    RFID_MANAGER._async_task = rfid_task
-    RFID_MANAGER._running = True
-    RFID_MANAGER._stop_event.clear()
+    # Start independent RFID background listener unless in cloud demo mode
+    rfid_task = None
+    if not CLOUD_DEMO:
+        rfid_task = asyncio.create_task(rfid_background_listener(), name="rfid-background-listener")
+        RFID_MANAGER._async_task = rfid_task
+        RFID_MANAGER._running = True
+        RFID_MANAGER._stop_event.clear()
+    else:
+        log.info("Cloud demo mode active: Hardware RFID listener and local camera disabled.")
 
     # NOTE: Camera is NOT started here — it starts only when a professor
     # explicitly begins a lecture session via POST /start-session.
 
     yield
 
-    RFID_MANAGER.stop()
-    if not rfid_task.done():
-        rfid_task.cancel()
-        try:
-            await rfid_task
-        except (asyncio.CancelledError, Exception):
-            pass
-    CAMERA.stop()
+    if rfid_task is not None:
+        RFID_MANAGER.stop()
+        if not rfid_task.done():
+            rfid_task.cancel()
+            try:
+                await rfid_task
+            except (asyncio.CancelledError, Exception):
+                pass
+    if not CLOUD_DEMO:
+        CAMERA.stop()
     log.info("Server shutdown complete.")
 
 
@@ -2597,11 +2607,19 @@ LECTURE_CSS = DESIGN_CSS + """
     overflow: hidden;
     position: relative;
   }
-  .pvideo img {
+  .pvideo img, .pvideo video {
     width: 100%;
     height: 100%;
     object-fit: cover;
     display: block;
+  }
+  .pvideo canvas#overlayCanvas {
+    position: absolute;
+    top: 0;
+    left: 0;
+    width: 100%;
+    height: 100%;
+    pointer-events: none;
   }
   .vph {
     text-align: center;
@@ -3124,6 +3142,14 @@ def render_students_page() -> str:
                 </span>
               </div>
             </div>
+            <!-- Inline Browser Webcam Modal for Cloud Demo Mode -->
+            <div id="webcamModal" style="display:none;margin-top:16px;background:var(--g950);border:var(--border);padding:16px;max-width:440px;">
+              <video id="modalWebcamVideo" autoplay playsinline muted style="width:100%;height:auto;max-height:260px;object-fit:cover;border:1px solid #444;display:block;margin-bottom:12px;"></video>
+              <div style="display:flex;gap:10px;">
+                <button type="button" class="btn-sm primary" onclick="captureModalPhoto()">التقاط الصورة</button>
+                <button type="button" class="btn-sm" onclick="closeModalWebcam()">إلغاء</button>
+              </div>
+            </div>
             <input type="hidden" id="photoBase64" name="photo_base64"/>
           </div>
 
@@ -3292,7 +3318,57 @@ function clearPhoto(){{
   document.getElementById('btnClearPhoto').style.display = 'none';
 }}
 
+let _modalStream = null;
+
+function closeModalWebcam(){{
+  if(_modalStream){{
+    _modalStream.getTracks().forEach(t => t.stop());
+    _modalStream = null;
+  }}
+  const m = document.getElementById('webcamModal');
+  if(m) m.style.display = 'none';
+  const v = document.getElementById('modalWebcamVideo');
+  if(v) v.srcObject = null;
+}}
+
+function captureModalPhoto(){{
+  const v = document.getElementById('modalWebcamVideo');
+  if(!v) return;
+  const canvas = document.createElement('canvas');
+  canvas.width = v.videoWidth || 640;
+  canvas.height = v.videoHeight || 480;
+  const ctx = canvas.getContext('2d');
+  ctx.drawImage(v, 0, 0);
+  const dataUrl = canvas.toDataURL('image/jpeg', 0.9);
+
+  document.getElementById('photoPreview').innerHTML = `<img src="${{dataUrl}}"/>`;
+  document.getElementById('photoBase64').value = dataUrl;
+  document.getElementById('stdPhotoFile').value = '';
+  document.getElementById('btnClearPhoto').style.display = 'inline-block';
+  closeModalWebcam();
+  showToast('تم التقاط الصورة من كاميرا المتصفح', false);
+}}
+
 function takeSnapshot(){{
+  const isCloud = {str(CLOUD_DEMO).lower()};
+  if(isCloud){{
+    const m = document.getElementById('webcamModal');
+    const v = document.getElementById('modalWebcamVideo');
+    if(!m || !v) return;
+    m.style.display = 'block';
+    navigator.mediaDevices.getUserMedia({{ video: {{ facingMode: 'user', width: 640, height: 480 }} }})
+      .then(stream => {{
+        _modalStream = stream;
+        v.srcObject = stream;
+        v.play();
+      }})
+      .catch(err => {{
+        closeModalWebcam();
+        showToast('تعذر الوصول لكاميرا المتصفح: ' + err.message, true);
+      }});
+    return;
+  }}
+
   const btn = document.getElementById('btnCamSnap');
   btn.textContent = 'جاري الالتقاط...';
   btn.disabled = true;
@@ -3313,30 +3389,7 @@ function takeSnapshot(){{
       }}
     }})
     .catch(err => {{
-      // Fallback to browser webcam (HTML5 getUserMedia)
-      navigator.mediaDevices.getUserMedia({{ video: {{ width: 640, height: 480 }} }})
-        .then(stream => {{
-          const video = document.createElement('video');
-          video.srcObject = stream;
-          video.play();
-          setTimeout(() => {{
-            const canvas = document.createElement('canvas');
-            canvas.width = video.videoWidth || 640;
-            canvas.height = video.videoHeight || 480;
-            const ctx = canvas.getContext('2d');
-            ctx.drawImage(video, 0, 0);
-            stream.getTracks().forEach(t => t.stop());
-            const dataUrl = canvas.toDataURL('image/jpeg', 0.9);
-            document.getElementById('photoPreview').innerHTML = `<img src="${{dataUrl}}"/>`;
-            document.getElementById('photoBase64').value = dataUrl;
-            document.getElementById('stdPhotoFile').value = '';
-            document.getElementById('btnClearPhoto').style.display = 'inline-block';
-            showToast('تم التقاط الصورة من كاميرا المتصفح', false);
-          }}, 500);
-        }})
-        .catch(navErr => {{
-          showToast('تعذر الوصول للكاميرا: ' + (err.message || navErr.message), true);
-        }});
+      showToast('تعذر الوصول للكاميرا: ' + err.message, true);
     }})
     .finally(() => {{
       btn.textContent = 'التقاط من الكاميرا';
@@ -3625,13 +3678,9 @@ def render_lecture_page(session: dict) -> str:
 
   <!-- BODY: VIDEO + ATTENDANCE REGISTRY -->
   <div class="lbody">
-    <!-- LEFT: 30 FPS MJPEG STREAM -->
+    <!-- LEFT: VIDEO STREAM -->
     <div class="pvideo">
-      <img id="vfeed" src="/video-feed" alt="Camera Feed" />
-      <div class="vph" id="vph" style="display:none;">
-        <div style="font-size:48px;color:var(--g700);margin-bottom:16px;">▣</div>
-        CAMERA FEED — DEVICE [1]<br>CONNECTING / AWAITING SIGNAL
-      </div>
+      {f'<video id="webCamVideo" autoplay playsinline muted style="width:100%;height:100%;object-fit:cover;"></video><canvas id="overlayCanvas"></canvas>' if CLOUD_DEMO else '<img id="vfeed" src="/video-feed" alt="Camera Feed" /><div class="vph" id="vph" style="display:none;"><div style="font-size:48px;color:var(--g700);margin-bottom:16px;">▣</div>CAMERA FEED — DEVICE [1]<br>CONNECTING / AWAITING SIGNAL</div>'}
     </div>
 
     <!-- RIGHT: REGISTRY WITH ORIGINAL STUDENT PROFILE PHOTOS -->
@@ -3651,7 +3700,11 @@ def render_lecture_page(session: dict) -> str:
     <button class="btn-c primary" onclick="exportReport()">&#8595; تصدير تقرير الحضور (Excel)</button>
     <button class="btn-c" onclick="reloadDB()">&#8635; تحديث الوجوه</button>
     <button class="btn-c" id="sndBtn" onclick="toggleSound()">الصوت: مفعّل</button>
-    <div class="live-ind"><div class="ldot"></div>بث حي 30 FPS · الحضور مسجل لمرة واحدة</div>
+    {f'''<div style="display:inline-flex;align-items:center;gap:6px;background:var(--g950);border:var(--border);padding:4px 8px;">
+      <input type="text" id="simRfidInput" placeholder="UID:12:34:56:78" style="background:#000;border:1px solid #444;color:#fff;padding:6px 10px;font-family:var(--mono);font-size:12px;width:150px;" />
+      <button class="btn-c" style="padding:6px 12px;font-size:12px;" onclick="simulateRfid()">محاكاة RFID (Demo)</button>
+    </div>''' if CLOUD_DEMO else ''}
+    <div class="live-ind"><div class="ldot"></div>{'بث كاميرا المتصفح' if CLOUD_DEMO else 'بث حي 30 FPS'} · الحضور مسجل لمرة واحدة</div>
     <button class="btn-c danger" onclick="endSession()">&#9632; إنهاء المحاضرة</button>
   </footer>
 
@@ -3807,37 +3860,140 @@ function endSession(){{
     .catch(() => window.location.href = '/');
 }}
 
-// 5. Intelligent Video Stream Watchdog & Auto-Recovery
-(function setupVideoFeedWatchdog(){{
-  const img = document.getElementById('vfeed');
-  const ph = document.getElementById('vph');
+// 5. RFID Simulation (Cloud Demo)
+function simulateRfid(){{
+  const inp = document.getElementById('simRfidInput');
+  if(!inp || !inp.value.trim()){{
+    alert('يرجى إدخال UID للبطاقة');
+    return;
+  }}
+  const fd = new FormData();
+  fd.append('uid', inp.value.trim());
+  fetch('/api/simulate-rfid', {{ method: 'POST', body: fd }})
+    .then(r => r.json())
+    .then(d => {{
+      if(d.ok){{
+        console.log('RFID simulated:', d.uid);
+      }} else {{
+        alert('خطأ في المحاكاة');
+      }}
+    }})
+    .catch(e => console.error(e));
+}}
+
+// 6. Video Stream Management: Local MJPEG vs Browser Webcam
+{'''(function setupBrowserWebcam(){
+  const video = document.getElementById("webCamVideo");
+  const overlay = document.getElementById("overlayCanvas");
+  if(!video || !overlay) return;
+
+  const offscreen = document.createElement("canvas");
+  const offCtx = offscreen.getContext("2d");
+  const ctx = overlay.getContext("2d");
+  let inFlight = false;
+
+  navigator.mediaDevices.getUserMedia({ video: { facingMode: "user", width: 640, height: 480 } })
+    .then(stream => {
+      video.srcObject = stream;
+      video.play();
+    })
+    .catch(err => {
+      console.error("Camera access error:", err);
+      alert("تعذر فتح كاميرا المتصفح: " + err.message);
+    });
+
+  function processFrame(){
+    if(video.readyState >= 2 && !inFlight){
+      inFlight = true;
+      const vw = video.videoWidth || 640;
+      const vh = video.videoHeight || 480;
+
+      offscreen.width = vw;
+      offscreen.height = vh;
+      offCtx.drawImage(video, 0, 0, vw, vh);
+
+      offscreen.toBlob(blob => {
+        if(!blob){ inFlight = false; return; }
+        const fd = new FormData();
+        fd.append("frame", blob, "frame.jpg");
+
+        fetch("/api/process-web-frame", { method: "POST", body: fd })
+          .then(r => r.json())
+          .then(data => {
+            if(data.ok && overlay){
+              overlay.width = video.clientWidth;
+              overlay.height = video.clientHeight;
+              ctx.clearRect(0, 0, overlay.width, overlay.height);
+
+              const sx = overlay.width / (data.width || vw);
+              const sy = overlay.height / (data.height || vh);
+
+              (data.boxes || []).forEach(box => {
+                const bx = box.left * sx;
+                const by = box.top * sy;
+                const bw = (box.right - box.left) * sx;
+                const bh = (box.bottom - box.top) * sy;
+
+                let strokeColor = "#888888";
+                let tagText = "[?] " + (box.name || "UNKNOWN");
+                if(box.status === "ok"){
+                  strokeColor = "#00e676";
+                  tagText = "[OK] " + box.name;
+                } else if(box.status === "wrong_section"){
+                  strokeColor = "#ff9100";
+                  tagText = "[WRONG SECTION] " + box.name;
+                }
+
+                ctx.strokeStyle = strokeColor;
+                ctx.lineWidth = 2;
+                ctx.strokeRect(bx, by, bw, bh);
+
+                ctx.fillStyle = strokeColor;
+                ctx.font = "bold 12px sans-serif";
+                const tm = ctx.measureText(tagText);
+                ctx.fillRect(bx, Math.max(0, by - 20), tm.width + 10, 20);
+
+                ctx.fillStyle = "#000000";
+                ctx.fillText(tagText, bx + 5, Math.max(14, by - 5));
+              });
+            }
+          })
+          .catch(e => console.error(e))
+          .finally(() => { inFlight = false; });
+      }, "image/jpeg", 0.75);
+    }
+  }
+
+  setInterval(processFrame, 450);
+})();''' if CLOUD_DEMO else '''(function setupVideoFeedWatchdog(){
+  const img = document.getElementById("vfeed");
+  const ph = document.getElementById("vph");
   if(!img) return;
 
   let retryTimer = null;
 
-  function reloadStream(){{
+  function reloadStream(){
     if(retryTimer) return;
-    if(ph) ph.style.display = 'block';
-    retryTimer = setTimeout(function(){{
+    if(ph) ph.style.display = "block";
+    retryTimer = setTimeout(function(){
       retryTimer = null;
-      console.log('[Video] Reconnecting to /video-feed ...');
-      img.src = '/video-feed?t=' + Date.now();
-    }}, 1200);
-  }}
+      console.log("[Video] Reconnecting to /video-feed ...");
+      img.src = "/video-feed?t=" + Date.now();
+    }, 1200);
+  }
 
-  img.onload = function(){{
-    img.style.display = 'block';
-    if(ph) ph.style.display = 'none';
-  }};
+  img.onload = function(){
+    img.style.display = "block";
+    if(ph) ph.style.display = "none";
+  };
 
-  img.onerror = function(){{
-    console.warn('[Video] Feed interrupted or awaiting camera signal. Auto-reconnecting...');
+  img.onerror = function(){
+    console.warn("[Video] Feed interrupted or awaiting camera signal. Auto-reconnecting...");
     reloadStream();
-  }};
+  };
 
-  // Ensure stream starts immediately with cache-buster
-  img.src = '/video-feed?t=' + Date.now();
-}})();
+  img.src = "/video-feed?t=" + Date.now();
+})();'''}
 </script>
 </body></html>"""
 
@@ -4240,7 +4396,8 @@ async def start_session(
         course     = course.strip(),
         instructor = inst_clean,
     )
-    CAMERA.start()
+    if not CLOUD_DEMO:
+        CAMERA.start()
     return RedirectResponse("/lecture", status_code=303)
 
 
@@ -4266,7 +4423,8 @@ async def video_feed():
     • Clicking "End Lecture" sets _stop_event; the generator exits on its
       next iteration without hanging the connection.
     """
-    CAMERA.start()
+    if not CLOUD_DEMO:
+        CAMERA.start()
     return StreamingResponse(
         CAMERA.get_jpeg_stream(),
         media_type="multipart/x-mixed-replace; boundary=frame",
@@ -4300,6 +4458,139 @@ async def websocket_attendance(websocket: WebSocket):
         WS_MANAGER.disconnect(websocket)
     except Exception:
         WS_MANAGER.disconnect(websocket)
+
+
+# ROUTES — REST API
+@app.post("/api/process-web-frame")
+async def process_web_frame(
+    frame: Optional[UploadFile] = File(None),
+    frame_b64: Optional[str] = Form(None),
+):
+    """
+    Browser webcam frame processing endpoint for cloud demo mode.
+    Downscales frame for fast CPU inference and matches detected faces
+    against enrolled students for the active session.
+    """
+    raw_bytes = None
+    if frame is not None:
+        raw_bytes = await frame.read()
+    elif frame_b64:
+        clean_b64 = frame_b64
+        if "," in clean_b64:
+            clean_b64 = clean_b64.split(",", 1)[1]
+        try:
+            raw_bytes = base64.b64decode(clean_b64)
+        except Exception:
+            raw_bytes = None
+
+    if not raw_bytes:
+        return JSONResponse({"ok": False, "error": "No image data received", "boxes": []})
+
+    nparr = np.frombuffer(raw_bytes, np.uint8)
+    bgr_img = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
+    if bgr_img is None or bgr_img.size == 0:
+        return JSONResponse({"ok": False, "error": "Invalid image format", "boxes": []})
+
+    orig_h, orig_w = bgr_img.shape[:2]
+
+    if not SESSION.active or FACE_DB.app is None:
+        return JSONResponse({"ok": True, "width": orig_w, "height": orig_h, "boxes": []})
+
+    # Downscale frame to max width 320px for fast CPU inference
+    max_w = 320
+    if orig_w > max_w:
+        scale = max_w / float(orig_w)
+        small_h = int(orig_h * scale)
+        small_bgr = cv2.resize(bgr_img, (max_w, small_h), interpolation=cv2.INTER_AREA)
+    else:
+        scale = 1.0
+        small_bgr = bgr_img
+
+    try:
+        faces = FACE_DB.app.get(small_bgr)
+    except Exception as exc:
+        log.error("Web frame face analysis error: %s", exc)
+        return JSONResponse({"ok": True, "width": orig_w, "height": orig_h, "boxes": []})
+
+    boxes = []
+    inv_scale = 1.0 / scale
+
+    for face in faces:
+        bbox = face.bbox.astype(int)
+        # Rescale bounding boxes back to original frame dimensions
+        left = max(0, int(bbox[0] * inv_scale))
+        top = max(0, int(bbox[1] * inv_scale))
+        right = min(orig_w, int(bbox[2] * inv_scale))
+        bottom = min(orig_h, int(bbox[3] * inv_scale))
+
+        raw_emb = face.embedding
+        norm = np.linalg.norm(raw_emb)
+        normed_emb = (raw_emb / norm).astype(np.float32) if norm > 0 else raw_emb.astype(np.float32)
+
+        matched_student, sim, in_section = FACE_DB.match_for_session(
+            normed_emb, SESSION.department, SESSION.stage, SESSION.section
+        )
+
+        if matched_student and in_section:
+            status = "ok"
+            name = matched_student["full_name"]
+            photo_b64 = FACE_DB.get_photo_by_id(matched_student["id"])
+            SESSION.try_record_attendance(
+                student_id=matched_student["id"],
+                name=name,
+                photo_b64=photo_b64,
+                method="كاميرا المتصفح (Webcam Demo)",
+            )
+        elif matched_student and not in_section:
+            status = "wrong_section"
+            name = matched_student["full_name"]
+            WS_MANAGER.broadcast({
+                "event": "wrong_section",
+                "data": {
+                    "name": name,
+                    "section": matched_student.get("section", ""),
+                    "department": matched_student.get("department", ""),
+                    "stage": matched_student.get("stage", ""),
+                },
+            })
+        else:
+            status = "unknown"
+            name = "UNKNOWN"
+
+        boxes.append({
+            "top": top,
+            "right": right,
+            "bottom": bottom,
+            "left": left,
+            "name": name,
+            "status": status,
+        })
+
+    return JSONResponse({
+        "ok": True,
+        "width": orig_w,
+        "height": orig_h,
+        "boxes": boxes,
+    })
+
+
+@app.post("/api/simulate-rfid")
+async def simulate_rfid(uid: Optional[str] = Form(None)):
+    """
+    Simulate RFID card scan for cloud demo mode.
+    """
+    if not CLOUD_DEMO:
+        raise HTTPException(403, "Simulation endpoint only available in CLOUD_DEMO mode.")
+
+    if not uid or not uid.strip():
+        raise HTTPException(400, "Card UID is required.")
+
+    clean_uid = uid.strip().upper()
+    if not clean_uid.startswith("UID:"):
+        clean_uid = f"UID:{clean_uid}"
+
+    RFID_MANAGER._process_payload(clean_uid)
+    return JSONResponse({"ok": True, "uid": clean_uid})
 
 
 # ROUTES — REST API
@@ -5347,8 +5638,9 @@ async def health():
 if __name__ == "__main__":
     uvicorn.run(
         "main:app",
-        host      = "127.0.0.1",
-        port      = 8000,
+        host      = SERVER_HOST,
+        port      = SERVER_PORT,
         reload    = False,
+        workers   = 1,
         log_level = "info",
     )

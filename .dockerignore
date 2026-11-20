@@ -1,0 +1,14 @@
+.git
+__pycache__
+*.py[cod]
+*$py.class
+.venv/
+env/
+venv/
+attendance.db
+attendance.db-*
+reports/
+known_faces/
+.mpl_cache/
+scratch/
+EcoSensing_ESP32_WiFi_Soil_Sentinel/
